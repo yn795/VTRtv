@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ブラウザ録画＋音声同時録音＆MP4変換</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px }
+    #video { border: 1px solid #ccc; background: #000 }
+    button { margin: 5px; padding: 10px }
+    #images img { margin: 5px; border: 1px solid #ddd }
+  </style>
+</head>
+<body>
+  <h1>ブラウザ録画＋音声同時録音＆MP4変換</h1>
+  <video id="video" width="705" height="397" autoplay playsinline></video><br>
+
+  <button id="startRecord">録画＋録音 開始</button>
+  <button id="stopRecord" disabled>録画＋録音 停止</button>
+  <button id="capture25">25枚キャプチャ</button>
+  <button id="capture1_5">1.5秒キャプチャ</button>
+  <button id="clearImages">画像クリア</button>
+  <button id="convertMp4">MP4変換</button>
+
+  <div id="images"></div>
+
+  <!-- ffmpeg.wasm -->
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.8/dist/ffmpeg.min.js"></script>
+  <script>
+    let stream;
+    let videoRecorder, audioRecorder;
+    let recordedVideoChunks = [], recordedAudioChunks = [];
+    let recordedVideoBlob = null, recordedAudioBlob = null;
+
+    async function startRecording() {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: 705, height: 397 },
+          audio: true    // システム音声もキャプチャ
+        });
+      } catch (err) {
+        alert("画面共有／音声キャプチャ許可が必要です: " + err);
+        return;
+      }
+
+      document.getElementById("video").srcObject = stream;
+
+      // 映像のみストリーム
+      const videoOnlyStream = new MediaStream(stream.getVideoTracks());
+      videoRecorder = new MediaRecorder(videoOnlyStream, { mimeType: "video/webm" });
+
+      // 音声のみストリーム
+      const audioOnlyStream = new MediaStream(stream.getAudioTracks());
+      audioRecorder = new MediaRecorder(audioOnlyStream, { mimeType: "audio/webm" });
+
+      // 録画データ配列をリセット
+      recordedVideoChunks = [];
+      recordedAudioChunks = [];
+
+      // 映像データ取得
+      videoRecorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) recordedVideoChunks.push(e.data);
+      };
+      videoRecorder.onstop = () => {
+        recordedVideoBlob = new Blob(recordedVideoChunks, { type: "video/webm" });
+        const url = URL.createObjectURL(recordedVideoBlob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "recording_video.webm"; a.style.display = "none";
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+      };
+
+      // 音声データ取得
+      audioRecorder.ondataavailable = e => {
+        if (e.data && e.data.size > 0) recordedAudioChunks.push(e.data);
+      };
+      audioRecorder.onstop = () => {
+        recordedAudioBlob = new Blob(recordedAudioChunks, { type: "audio/webm" });
+        const url = URL.createObjectURL(recordedAudioBlob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "recording_audio.webm"; a.style.display = "none";
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+      };
+
+      // 録画＋録音スタート
+      videoRecorder.start();
+      audioRecorder.start();
+      document.getElementById("startRecord").disabled = true;
+      document.getElementById("stopRecord").disabled = false;
+    }
+
+    function stopRecording() {
+      if (videoRecorder && videoRecorder.state !== "inactive") videoRecorder.stop();
+      if (audioRecorder && audioRecorder.state !== "inactive") audioRecorder.stop();
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      document.getElementById("startRecord").disabled = false;
+      document.getElementById("stopRecord").disabled = true;
+    }
+
+    // --- キャプチャ＆画像処理は既存コードをそのまま ---
+    function captureImage() {
+      const video = document.getElementById("video");
+      if (!video || !video.srcObject) { alert("画面共有を開始してください"); return; }
+      const canvas = document.createElement("canvas");
+      canvas.width = 705; canvas.height = 397;
+      canvas.getContext("2d").drawImage(video, 0, 0, 705, 397);
+      const img = document.createElement("img");
+      img.src = canvas.toDataURL("image/png");
+      document.getElementById("images").appendChild(img);
+    }
+    async function capture25Images() { for (let i=0;i<25;i++){ captureImage(); await new Promise(r=>setTimeout(r,1000)); } }
+    function captureImagesEvery1_5Sec() {
+      let cnt=0;
+      const iv = setInterval(()=>{
+        if(cnt>=25){ clearInterval(iv); return; }
+        captureImage(); cnt++;
+      },1500);
+    }
+    function clearImages() { document.getElementById("images").innerHTML = ""; }
+
+    // --- MP4変換（映像＋音声をマージ） ---
+    async function convertToMp4() {
+      if (!recordedVideoBlob) { alert("動画 WebM がありません"); return; }
+      const { createFFmpeg, fetchFile } = FFmpeg;
+      const ffmpeg = createFFmpeg({ log: true });
+      document.getElementById("convertMp4").disabled = true;
+      document.getElementById("convertMp4").innerText = "変換中…";
+      await ffmpeg.load();
+      // 映像を投入
+      ffmpeg.FS('writeFile', 'in_video.webm', await fetchFile(recordedVideoBlob));
+      let args;
+      if (recordedAudioBlob) {
+        // 音声も投入してマージ
+        ffmpeg.FS('writeFile', 'in_audio.webm', await fetchFile(recordedAudioBlob));
+        args = [
+          '-i','in_video.webm',
+          '-i','in_audio.webm',
+          '-c:v','libx264','-preset','fast','-crf','23',
+          '-c:a','aac','-b:a','128k',
+          '-shortest',
+          'out.mp4'
+        ];
+      } else {
+        // 音声なしで変換
+        args = [
+          '-i','in_video.webm',
+          '-c:v','libx264','-preset','fast','-crf','23',
+          'out.mp4'
+        ];
+      }
+      await ffmpeg.run(...args);
+      const data = ffmpeg.FS('readFile', 'out.mp4');
+      const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
+      const url = URL.createObjectURL(mp4Blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "recording.mp4"; a.style.display = "none";
+      document.body.appendChild(a); a.click();
+      setTimeout(()=>{
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        document.getElementById("convertMp4").disabled = false;
+        document.getElementById("convertMp4").innerText = "MP4変換";
+      },100);
+    }
+
+    // イベントバインド
+    document.getElementById("startRecord").addEventListener("click", startRecording);
+    document.getElementById("stopRecord").addEventListener("click", stopRecording);
+    document.getElementById("capture25").addEventListener("click", capture25Images);
+    document.getElementById("capture1_5").addEventListener("click", captureImagesEvery1_5Sec);
+    document.getElementById("clearImages").addEventListener("click", clearImages);
+    document.getElementById("convertMp4").addEventListener("click", convertToMp4);
+  </script>
+</body>
+</html>
